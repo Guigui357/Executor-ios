@@ -15,13 +15,15 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---------- 1. Build Dobby for iOS arm64 ----------
+      # =====================================================================
+      # 1. DOBBY
+      # =====================================================================
       - name: Clone Dobby
         run: |
           git clone https://github.com/jmpews/Dobby.git --depth=1 -b ${DOBBY_VERSION} dobby-src || \
           git clone https://github.com/jmpews/Dobby.git --depth=1 dobby-src
           cd dobby-src
-          git submodule update --init --recursive
+          git submodule update --init --recursive || true
           git log -1 --oneline
           ls -la
 
@@ -57,7 +59,26 @@ jobs:
           file dobby-out/libdobby.a || echo "no libdobby.a"
           lipo -info dobby-out/libdobby.a || true
 
-      # ---------- 2. Import enterprise signing cert ----------
+      # =====================================================================
+      # 2. CERT DEBUG + IMPORT
+      # =====================================================================
+      - name: Debug cert secret
+        if: env.HAS_CERT == 'true'
+        env:
+          HAS_CERT: ${{ secrets.SIGNING_CERT_P12 != '' }}
+          SIGNING_CERT_P12: ${{ secrets.SIGNING_CERT_P12 }}
+          SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+        run: |
+          set -x
+          echo "secret length: ${#SIGNING_CERT_P12}"
+          echo "last 4 chars: ${SIGNING_CERT_P12: -4}"
+          echo -n "$SIGNING_CERT_P12" | base64 --decode > /tmp/cert.p12
+          echo "decoded size: $(wc -c < /tmp/cert.p12)"
+          file /tmp/cert.p12
+          xxd /tmp/cert.p12 | head -3
+          openssl pkcs12 -info -in /tmp/cert.p12 -noout \
+            -passin pass:"$SIGNING_CERT_PASSWORD" 2>&1 | head -10
+
       - name: Import signing cert
         if: env.HAS_CERT == 'true'
         env:
@@ -67,19 +88,61 @@ jobs:
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
           CERT_PATH=$RUNNER_TEMP/cert.p12
+          LEGACY_PATH=$RUNNER_TEMP/cert-legacy.p12
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+
+          # decode
           echo -n "$SIGNING_CERT_P12" | base64 --decode -o "$CERT_PATH"
+          SIZE=$(wc -c < "$CERT_PATH")
+          echo "decoded cert size: $SIZE"
+          if [ "$SIZE" -lt 100 ]; then
+            echo "::error::Decoded .p12 is too small ($SIZE bytes) — secret is empty, truncated, or not base64"
+            exit 1
+          fi
+
+          # verify magic bytes: PKCS#12 starts with 0x30 0x82
+          FIRST=$(xxd -p -l 2 "$CERT_PATH")
+          if [ "$FIRST" != "3082" ]; then
+            echo "::error::File does not start with 30 82 (got $FIRST) — not a PKCS#12"
+            echo "::error::Did you export a .p12 from Keychain, or just paste a .cer/.pem?"
+            exit 1
+          fi
+
+          # verify password opens the p12
+          if ! openssl pkcs12 -in "$CERT_PATH" -out /tmp/cert.pem -nodes \
+                 -passin pass:"$SIGNING_CERT_PASSWORD" 2>/tmp/p12.err; then
+            echo "::error::openssl cannot open the .p12 — password mismatch or unsupported format"
+            cat /tmp/p12.err
+            exit 1
+          fi
+          echo "::notice::.p12 password verified OK"
+
+          # convert to legacy PBE (macOS security import can't read AES-256 PBE)
+          openssl pkcs12 -export -in /tmp/cert.pem -out "$LEGACY_PATH" \
+            -passout pass:"$SIGNING_CERT_PASSWORD" \
+            -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
+
+          # create temp keychain
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security import "$CERT_PATH" -P "$SIGNING_CERT_PASSWORD" \
-            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+
+          # import legacy p12
+          if ! security import "$LEGACY_PATH" \
+                 -P "$SIGNING_CERT_PASSWORD" \
+                 -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"; then
+            echo "::error::security import failed — see error above"
+            exit 1
+          fi
+
           security list-keychain -d user -s "$KEYCHAIN_PATH"
           security set-key-partition-list -S apple-tool:,apple: \
             -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security find-identity -v -p codesigning
 
-      # ---------- 3. Build the dylib ----------
+      # =====================================================================
+      # 3. BUILD DYLIB
+      # =====================================================================
       - name: Compile libRbxHook.dylib
         run: |
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -95,7 +158,14 @@ jobs:
       - name: Show linked libraries
         run: otool -L libRbxHook.dylib
 
-      # ---------- 4. Strip + sign ----------
+      - name: Verify dylib arch
+        run: |
+          lipo -info libRbxHook.dylib
+          file libRbxHook.dylib
+
+      # =====================================================================
+      # 4. STRIP + SIGN
+      # =====================================================================
       - name: Strip debug symbols
         run: xcrun -sdk iphoneos strip -x libRbxHook.dylib || true
 
@@ -109,7 +179,9 @@ jobs:
             --preserve-metadata=identifier,entitlements libRbxHook.dylib
           codesign -dv --verbose=4 libRbxHook.dylib || true
 
-      # ---------- 5. Upload artifacts ----------
+      # =====================================================================
+      # 5. UPLOAD
+      # =====================================================================
       - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
@@ -118,6 +190,19 @@ jobs:
             libRbxHook.dylib
             dobby-out/libdobby.a
           retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload debug logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-logs
+          path: |
+            /tmp/cert.p12
+            /tmp/cert.pem
+            /tmp/p12.err
+          retention-days: 3
+          if-no-files-found: ignore
 
       - name: Cleanup keychain
         if: always()
@@ -125,3 +210,4 @@ jobs:
           if [ -f "$RUNNER_TEMP/app-signing.keychain-db" ]; then
             security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" || true
           fi
+          rm -f /tmp/cert.p12 /tmp/cert.pem /tmp/p12.err "$RUNNER_TEMP/cert-legacy.p12" || true
