@@ -75,17 +75,15 @@ jobs:
           echo "last 4: '$(tail -c 4 /tmp/cert.b64)'"
           if [ "$LEN" -ne 4336 ]; then
             echo "::error::base64 secret is $LEN chars, expected 4336"
-            echo "::error::Secret is truncated. Push via: gh secret set SIGNING_CERT_P12 < cert.b64"
             exit 1
           fi
-          # BSD base64 on macos-14: -D -i -o
           base64 -D -i /tmp/cert.b64 -o /tmp/cert.p12
           SIZE=$(wc -c < /tmp/cert.p12 | tr -d ' ')
           echo "decoded size: $SIZE"
           file /tmp/cert.p12
           xxd /tmp/cert.p12 | head -2
-          if [ "$SIZE" -ne 3252 ]; then
-            echo "::error::decoded p12 is $SIZE bytes, expected 3252"
+          if [ "$SIZE" -ne 3251 ]; then
+            echo "::error::decoded p12 is $SIZE bytes, expected 3251"
             exit 1
           fi
           echo "::notice::cert secret OK ($LEN chars -> $SIZE bytes)"
