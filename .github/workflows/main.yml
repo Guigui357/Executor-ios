@@ -87,59 +87,57 @@ jobs:
           SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
+          set -e
           CERT_PATH=$RUNNER_TEMP/cert.p12
           LEGACY_PATH=$RUNNER_TEMP/cert-legacy.p12
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
 
-          # decode
-          echo -n "$SIGNING_CERT_P12" | base64 --decode -o "$CERT_PATH"
-          SIZE=$(wc -c < "$CERT_PATH")
-          echo "decoded cert size: $SIZE"
-          if [ "$SIZE" -lt 100 ]; then
-            echo "::error::Decoded .p12 is too small ($SIZE bytes) — secret is empty, truncated, or not base64"
+          # Write base64 to file with printf (no echo -n quirks)
+          printf '%s' "$SIGNING_CERT_P12" > /tmp/cert.b64
+          B64_LEN=$(wc -c < /tmp/cert.b64 | tr -d ' ')
+          echo "b64 length: $B64_LEN"
+          if [ "$B64_LEN" -ne 4332 ]; then
+            echo "::error::base64 secret is $B64_LEN chars, expected 4332"
+            echo "::error::Secret is truncated. Use: gh secret set < cert.b64"
             exit 1
           fi
 
-          # verify magic bytes: PKCS#12 starts with 0x30 0x82
-          FIRST=$(xxd -p -l 2 "$CERT_PATH")
-          if [ "$FIRST" != "3082" ]; then
-            echo "::error::File does not start with 30 82 (got $FIRST) — not a PKCS#12"
-            echo "::error::Did you export a .p12 from Keychain, or just paste a .cer/.pem?"
+          # BSD base64 decode (macOS runner)
+          base64 -D -i /tmp/cert.b64 -o "$CERT_PATH"
+          SIZE=$(wc -c < "$CERT_PATH" | tr -d ' ')
+          echo "decoded size: $SIZE"
+          if [ "$SIZE" -ne 3247 ]; then
+            echo "::error::decoded p12 is $SIZE bytes, expected 3247"
             exit 1
           fi
+          file "$CERT_PATH"
+          xxd "$CERT_PATH" | head -2
 
-          # verify password opens the p12
+          # Verify password
           if ! openssl pkcs12 -in "$CERT_PATH" -out /tmp/cert.pem -nodes \
                  -passin pass:"$SIGNING_CERT_PASSWORD" 2>/tmp/p12.err; then
-            echo "::error::openssl cannot open the .p12 — password mismatch or unsupported format"
+            echo "::error::openssl cannot open the .p12"
             cat /tmp/p12.err
             exit 1
           fi
-          echo "::notice::.p12 password verified OK"
+          echo "::notice::password OK"
 
-          # convert to legacy PBE (macOS security import can't read AES-256 PBE)
+          # Convert to legacy PBE
           openssl pkcs12 -export -in /tmp/cert.pem -out "$LEGACY_PATH" \
             -passout pass:"$SIGNING_CERT_PASSWORD" \
             -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
 
-          # create temp keychain
+          # Keychain
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-          # import legacy p12
-          if ! security import "$LEGACY_PATH" \
-                 -P "$SIGNING_CERT_PASSWORD" \
-                 -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"; then
-            echo "::error::security import failed — see error above"
-            exit 1
-          fi
-
+          security import "$LEGACY_PATH" -P "$SIGNING_CERT_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
           security list-keychain -d user -s "$KEYCHAIN_PATH"
           security set-key-partition-list -S apple-tool:,apple: \
             -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security find-identity -v -p codesigning
-
+  
       # =====================================================================
       # 3. BUILD DYLIB
       # =====================================================================
