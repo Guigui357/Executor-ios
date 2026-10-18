@@ -1,0 +1,135 @@
+name: build-dylib
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+
+    env:
+      SCHEME: libRbxHook
+      DOBBY_VERSION: "1.3.0"   # or "master" for latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------- 1. Build Dobby for iOS arm64 ----------
+      - name: Clone Dobby
+        run: |
+          git clone https://github.com/jmpews/Dobby.git --depth=1 -b ${DOBBY_VERSION} dobby-src || \
+          git clone https://github.com/jmpews/Dobby.git --depth=1 dobby-src
+          cd dobby-src
+          git log -1 --oneline
+
+      - name: Build Dobby (iOS arm64 static)
+        run: |
+          cd dobby-src
+          mkdir -p build-ios-arm64 && cd build-ios-arm64
+          cmake .. \
+            -G Xcode \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/ios.toolchain.cmake \
+            -DPLATFORM=OS64 \
+            -DARCHS="arm64" \
+            -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+            -DENABLE_BITCODE=0 \
+            -DENABLE_ARC=0 \
+            -DENABLE_VISIBILITY=1 \
+            -DDEPLOYMENT_TARGET=15.0 \
+            -DDynamicBinaryInstrument=ON \
+            -DNearBranch=ON \
+            -DPlugin.SymbolResolver=ON \
+            -DPlugin.Darwin.HideLibrary=ON \
+            -DPlugin.Darwin.ObjectiveC=ON \
+            -DDarwin.GenerateFramework=OFF
+          xcodebuild -project Dobby.xcodeproj \
+            -scheme Dobby \
+            -configuration Release \
+            -sdk iphoneos \
+            -arch arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            BUILD_LIBRARY_FOR_DISTRIBUTION=NO
+          # Locate the static library
+          find . -name "libdobby.a" -o -name "Dobby" -type f | head
+          mkdir -p ../../dobby-out
+          cp $(find . -name "libdobby.a" | head -1) ../../dobby-out/
+          cp -R ../include ../../dobby-out/ 2>/dev/null || true
+
+      - name: Verify Dobby artifacts
+        run: |
+          ls -la dobby-out
+          file dobby-out/libdobby.a || echo "no libdobby.a"
+          # If Dobby built as a framework instead:
+          find dobby-src/build-ios-arm64 -name "Dobby.framework" -maxdepth 6 || true
+
+      # ---------- 2. Import enterprise signing cert ----------
+      - name: Import signing cert
+        if: ${{ secrets.SIGNING_CERT_P12 != '' }}
+        env:
+          SIGNING_CERT_P12: ${{ secrets.SIGNING_CERT_P12 }}
+          SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          CERT_PATH=$RUNNER_TEMP/cert.p12
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          echo -n "$SIGNING_CERT_P12" | base64 --decode -o "$CERT_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$SIGNING_CERT_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      # ---------- 3. Build the dylib ----------
+      - name: Compile libRbxHook.dylib
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          echo "SDK: $SDK"
+          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
+            -o libRbxHook.dylib libRbxHook.c \
+            -framework Foundation -framework UIKit \
+            -fobjc-arc -mios-version-min=15.0 \
+            -I dobby-out/include \
+            -L dobby-out -lDobby \
+            -isysroot "$SDK"
+
+      - name: Show linked libraries
+        run: |
+          otool -L libRbxHook.dylib
+
+      # ---------- 4. Strip + sign ----------
+      - name: Strip debug symbols
+        run: |
+          xcrun -sdk iphoneos strip -x libRbxHook.dylib
+
+      - name: Sign dylib with enterprise cert
+        if: ${{ secrets.SIGNING_CERT_P12 != '' }}
+        env:
+          CERT_NAME: ${{ secrets.SIGNING_CERT_NAME }}
+        run: |
+          codesign -s "$CERT_NAME" --force --timestamp=none \
+            --preserve-metadata=identifier,entitlements libRbxHook.dylib
+          codesign -dv --verbose=4 libRbxHook.dylib || true
+
+      # ---------- 5. Upload artifacts ----------
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: libRbxHook
+          path: |
+            libRbxHook.dylib
+            dobby-out/libdobby.a
+          retention-days: 30
+
+      - name: Cleanup keychain
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/app-signing.keychain-db" ]; then
+            security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" || true
+          fi
