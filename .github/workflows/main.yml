@@ -30,6 +30,7 @@ jobs:
           cmake .. \
             -G Xcode \
             -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_SYSTEM_PROCESSOR=arm64 \
             -DCMAKE_OSX_SYSROOT=iphoneos \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
@@ -52,6 +53,7 @@ jobs:
           mkdir -p ../../dobby-out
           cp $(find . -name "libdobby.a" | head -1) ../../dobby-out/ || true
           cp -R ../include ../../dobby-out/ 2>/dev/null || true
+          
       - name: Verify Dobby artifacts
         run: |
           ls -la dobby-out
