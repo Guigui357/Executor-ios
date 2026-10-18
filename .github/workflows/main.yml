@@ -16,7 +16,7 @@ jobs:
         uses: actions/checkout@v4
 
       # =====================================================================
-      # 1. DOBBY
+      # 1. BUILD DOBBY
       # =====================================================================
       - name: Clone Dobby
         run: |
@@ -60,74 +60,66 @@ jobs:
           lipo -info dobby-out/libdobby.a || true
 
       # =====================================================================
-      # 2. CERT DEBUG + IMPORT
+      # 2. DECODE + VERIFY CERT
       # =====================================================================
-      - name: Debug cert secret
+      - name: Decode certificate secret
         if: env.HAS_CERT == 'true'
         env:
           HAS_CERT: ${{ secrets.SIGNING_CERT_P12 != '' }}
           SIGNING_CERT_P12: ${{ secrets.SIGNING_CERT_P12 }}
-          SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
         run: |
-          set -x
-          echo "secret length: ${#SIGNING_CERT_P12}"
-          echo "last 4 chars: ${SIGNING_CERT_P12: -4}"
-          echo -n "$SIGNING_CERT_P12" | base64 --decode > /tmp/cert.p12
-          echo "decoded size: $(wc -c < /tmp/cert.p12)"
+          set -e
+          printf '%s' "$SIGNING_CERT_P12" > /tmp/cert.b64
+          LEN=$(wc -c < /tmp/cert.b64 | tr -d ' ')
+          echo "b64 length: $LEN"
+          echo "last 4: '$(tail -c 4 /tmp/cert.b64)'"
+          if [ "$LEN" -ne 4336 ]; then
+            echo "::error::base64 secret is $LEN chars, expected 4336"
+            echo "::error::Secret is truncated. Push via: gh secret set SIGNING_CERT_P12 < cert.b64"
+            exit 1
+          fi
+          # BSD base64 on macos-14: -D -i -o
+          base64 -D -i /tmp/cert.b64 -o /tmp/cert.p12
+          SIZE=$(wc -c < /tmp/cert.p12 | tr -d ' ')
+          echo "decoded size: $SIZE"
           file /tmp/cert.p12
-          xxd /tmp/cert.p12 | head -3
-          openssl pkcs12 -info -in /tmp/cert.p12 -noout \
-            -passin pass:"$SIGNING_CERT_PASSWORD" 2>&1 | head -10
+          xxd /tmp/cert.p12 | head -2
+          if [ "$SIZE" -ne 3252 ]; then
+            echo "::error::decoded p12 is $SIZE bytes, expected 3252"
+            exit 1
+          fi
+          echo "::notice::cert secret OK ($LEN chars -> $SIZE bytes)"
 
+      # =====================================================================
+      # 3. IMPORT CERT
+      # =====================================================================
       - name: Import signing cert
         if: env.HAS_CERT == 'true'
         env:
           HAS_CERT: ${{ secrets.SIGNING_CERT_P12 != '' }}
-          SIGNING_CERT_P12: ${{ secrets.SIGNING_CERT_P12 }}
           SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
           set -e
-          CERT_PATH=$RUNNER_TEMP/cert.p12
+          CERT_PATH=/tmp/cert.p12
           LEGACY_PATH=$RUNNER_TEMP/cert-legacy.p12
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
 
-          # Write base64 to file with printf (no echo -n quirks)
-          printf '%s' "$SIGNING_CERT_P12" > /tmp/cert.b64
-          B64_LEN=$(wc -c < /tmp/cert.b64 | tr -d ' ')
-          echo "b64 length: $B64_LEN"
-          if [ "$B64_LEN" -ne 4332 ]; then
-            echo "::error::base64 secret is $B64_LEN chars, expected 4332"
-            echo "::error::Secret is truncated. Use: gh secret set < cert.b64"
-            exit 1
-          fi
-
-          # BSD base64 decode (macOS runner)
-          base64 -D -i /tmp/cert.b64 -o "$CERT_PATH"
-          SIZE=$(wc -c < "$CERT_PATH" | tr -d ' ')
-          echo "decoded size: $SIZE"
-          if [ "$SIZE" -ne 3247 ]; then
-            echo "::error::decoded p12 is $SIZE bytes, expected 3247"
-            exit 1
-          fi
-          file "$CERT_PATH"
-          xxd "$CERT_PATH" | head -2
-
-          # Verify password
+          # Verify password with openssl
           if ! openssl pkcs12 -in "$CERT_PATH" -out /tmp/cert.pem -nodes \
                  -passin pass:"$SIGNING_CERT_PASSWORD" 2>/tmp/p12.err; then
             echo "::error::openssl cannot open the .p12"
             cat /tmp/p12.err
             exit 1
           fi
-          echo "::notice::password OK"
+          echo "::notice::password verified"
 
-          # Convert to legacy PBE
+          # Convert to legacy PBE (macOS security import cannot read AES-256 PBE)
           openssl pkcs12 -export -in /tmp/cert.pem -out "$LEGACY_PATH" \
             -passout pass:"$SIGNING_CERT_PASSWORD" \
             -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1
 
-          # Keychain
+          # Import to temp keychain
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
@@ -137,12 +129,13 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: \
             -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
           security find-identity -v -p codesigning
-  
+
       # =====================================================================
-      # 3. BUILD DYLIB
+      # 4. BUILD DYLIB
       # =====================================================================
       - name: Compile libRbxHook.dylib
         run: |
+          set -e
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           echo "SDK: $SDK"
           xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
@@ -153,16 +146,14 @@ jobs:
             -L dobby-out -lDobby \
             -isysroot "$SDK"
 
-      - name: Show linked libraries
-        run: otool -L libRbxHook.dylib
-
-      - name: Verify dylib arch
+      - name: Verify dylib
         run: |
+          otool -L libRbxHook.dylib
           lipo -info libRbxHook.dylib
           file libRbxHook.dylib
 
       # =====================================================================
-      # 4. STRIP + SIGN
+      # 5. STRIP + SIGN
       # =====================================================================
       - name: Strip debug symbols
         run: xcrun -sdk iphoneos strip -x libRbxHook.dylib || true
@@ -173,12 +164,13 @@ jobs:
           HAS_CERT: ${{ secrets.SIGNING_CERT_P12 != '' }}
           CERT_NAME: ${{ secrets.SIGNING_CERT_NAME }}
         run: |
+          set -e
           codesign -s "$CERT_NAME" --force --timestamp=none \
             --preserve-metadata=identifier,entitlements libRbxHook.dylib
-          codesign -dv --verbose=4 libRbxHook.dylib || true
+          codesign -dv --verbose=4 libRbxHook.dylib
 
       # =====================================================================
-      # 5. UPLOAD
+      # 6. UPLOAD
       # =====================================================================
       - name: Upload dylib
         uses: actions/upload-artifact@v4
@@ -196,6 +188,7 @@ jobs:
         with:
           name: debug-logs
           path: |
+            /tmp/cert.b64
             /tmp/cert.p12
             /tmp/cert.pem
             /tmp/p12.err
@@ -208,4 +201,5 @@ jobs:
           if [ -f "$RUNNER_TEMP/app-signing.keychain-db" ]; then
             security delete-keychain "$RUNNER_TEMP/app-signing.keychain-db" || true
           fi
-          rm -f /tmp/cert.p12 /tmp/cert.pem /tmp/p12.err "$RUNNER_TEMP/cert-legacy.p12" || true
+          rm -f /tmp/cert.b64 /tmp/cert.p12 /tmp/cert.pem /tmp/p12.err \
+                "$RUNNER_TEMP/cert-legacy.p12" || true
