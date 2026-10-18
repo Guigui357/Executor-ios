@@ -8,10 +8,8 @@ on:
 jobs:
   build:
     runs-on: macos-14
-
     env:
-      SCHEME: libRbxHook
-      DOBBY_VERSION: "1.3.0"   # or "master" for latest
+      DOBBY_VERSION: "1.3.0"
 
     steps:
       - name: Checkout
@@ -53,23 +51,20 @@ jobs:
             ONLY_ACTIVE_ARCH=NO \
             CODE_SIGNING_ALLOWED=NO \
             BUILD_LIBRARY_FOR_DISTRIBUTION=NO
-          # Locate the static library
-          find . -name "libdobby.a" -o -name "Dobby" -type f | head
           mkdir -p ../../dobby-out
-          cp $(find . -name "libdobby.a" | head -1) ../../dobby-out/
+          cp $(find . -name "libdobby.a" | head -1) ../../dobby-out/ || true
           cp -R ../include ../../dobby-out/ 2>/dev/null || true
 
       - name: Verify Dobby artifacts
         run: |
           ls -la dobby-out
           file dobby-out/libdobby.a || echo "no libdobby.a"
-          # If Dobby built as a framework instead:
-          find dobby-src/build-ios-arm64 -name "Dobby.framework" -maxdepth 6 || true
 
       # ---------- 2. Import enterprise signing cert ----------
       - name: Import signing cert
-        if: ${{ secrets.SIGNING_CERT_P12 != '' }}
+        if: env.HAS_CERT == 'true'
         env:
+          HAS_CERT: ${{ secrets.SIGNING_CERT_P12 != '' }}
           SIGNING_CERT_P12: ${{ secrets.SIGNING_CERT_P12 }}
           SIGNING_CERT_PASSWORD: ${{ secrets.SIGNING_CERT_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
@@ -100,17 +95,16 @@ jobs:
             -isysroot "$SDK"
 
       - name: Show linked libraries
-        run: |
-          otool -L libRbxHook.dylib
+        run: otool -L libRbxHook.dylib
 
       # ---------- 4. Strip + sign ----------
       - name: Strip debug symbols
-        run: |
-          xcrun -sdk iphoneos strip -x libRbxHook.dylib
+        run: xcrun -sdk iphoneos strip -x libRbxHook.dylib
 
-      - name: Sign dylib with enterprise cert
-        if: ${{ secrets.SIGNING_CERT_P12 != '' }}
+      - name: Sign dylib
+        if: env.HAS_CERT == 'true'
         env:
+          HAS_CERT: ${{ secrets.SIGNING_CERT_P12 != '' }}
           CERT_NAME: ${{ secrets.SIGNING_CERT_NAME }}
         run: |
           codesign -s "$CERT_NAME" --force --timestamp=none \
