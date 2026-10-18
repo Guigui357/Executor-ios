@@ -29,14 +29,13 @@ jobs:
           mkdir -p build-ios-arm64 && cd build-ios-arm64
           cmake .. \
             -G Xcode \
-            -DCMAKE_TOOLCHAIN_FILE=cmake/ios.toolchain.cmake \
-            -DPLATFORM=OS64 \
-            -DARCHS="arm64" \
-            -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
             -DENABLE_BITCODE=0 \
             -DENABLE_ARC=0 \
             -DENABLE_VISIBILITY=1 \
-            -DDEPLOYMENT_TARGET=15.0 \
             -DDynamicBinaryInstrument=ON \
             -DNearBranch=ON \
             -DPlugin.SymbolResolver=ON \
@@ -49,12 +48,10 @@ jobs:
             -sdk iphoneos \
             -arch arm64 \
             ONLY_ACTIVE_ARCH=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            BUILD_LIBRARY_FOR_DISTRIBUTION=NO
+            CODE_SIGNING_ALLOWED=NO
           mkdir -p ../../dobby-out
           cp $(find . -name "libdobby.a" | head -1) ../../dobby-out/ || true
           cp -R ../include ../../dobby-out/ 2>/dev/null || true
-
       - name: Verify Dobby artifacts
         run: |
           ls -la dobby-out
