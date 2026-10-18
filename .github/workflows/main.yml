@@ -21,43 +21,41 @@ jobs:
           git clone https://github.com/jmpews/Dobby.git --depth=1 -b ${DOBBY_VERSION} dobby-src || \
           git clone https://github.com/jmpews/Dobby.git --depth=1 dobby-src
           cd dobby-src
+          git submodule update --init --recursive
           git log -1 --oneline
+          ls -la
 
-      - name: Build Dobby (iOS arm64 static)
+      - name: Build Dobby (iOS arm64 static, Makefile generator)
         run: |
           cd dobby-src
           mkdir -p build-ios-arm64 && cd build-ios-arm64
           cmake .. \
-            -G Xcode \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_SYSTEM_PROCESSOR=arm64 \
             -DCMAKE_OSX_SYSROOT=iphoneos \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
-            -DENABLE_BITCODE=0 \
-            -DENABLE_ARC=0 \
-            -DENABLE_VISIBILITY=1 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
             -DDynamicBinaryInstrument=ON \
             -DNearBranch=ON \
             -DPlugin.SymbolResolver=ON \
             -DPlugin.Darwin.HideLibrary=ON \
             -DPlugin.Darwin.ObjectiveC=ON \
-            -DDarwin.GenerateFramework=OFF
-          xcodebuild -project Dobby.xcodeproj \
-            -scheme Dobby \
-            -configuration Release \
-            -sdk iphoneos \
-            -arch arm64 \
-            ONLY_ACTIVE_ARCH=NO \
-            CODE_SIGNING_ALLOWED=NO
+            -DDOBBY_BUILD_EXAMPLE=OFF \
+            -DDOBBY_BUILD_TEST=OFF
+          make -j$(sysctl -n hw.ncpu)
+          echo "=== built artifacts ==="
+          find . -name "libdobby.a" -o -name "*.dylib" | head
           mkdir -p ../../dobby-out
           cp $(find . -name "libdobby.a" | head -1) ../../dobby-out/ || true
           cp -R ../include ../../dobby-out/ 2>/dev/null || true
-          
+
       - name: Verify Dobby artifacts
         run: |
           ls -la dobby-out
           file dobby-out/libdobby.a || echo "no libdobby.a"
+          lipo -info dobby-out/libdobby.a || true
 
       # ---------- 2. Import enterprise signing cert ----------
       - name: Import signing cert
@@ -79,6 +77,7 @@ jobs:
           security list-keychain -d user -s "$KEYCHAIN_PATH"
           security set-key-partition-list -S apple-tool:,apple: \
             -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security find-identity -v -p codesigning
 
       # ---------- 3. Build the dylib ----------
       - name: Compile libRbxHook.dylib
@@ -98,7 +97,7 @@ jobs:
 
       # ---------- 4. Strip + sign ----------
       - name: Strip debug symbols
-        run: xcrun -sdk iphoneos strip -x libRbxHook.dylib
+        run: xcrun -sdk iphoneos strip -x libRbxHook.dylib || true
 
       - name: Sign dylib
         if: env.HAS_CERT == 'true'
