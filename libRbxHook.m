@@ -374,22 +374,6 @@ static void on_load(void) {
 
     install_hooks();
 
-    logmsg("state=%p pcall=%p loadbuffer=%p",
-           g_lua_state, g_lua_pcall, g_lua_loadbuffer);
-
-    pthread_t t;
-    if (pthread_create(&t, NULL, server_thread, NULL) == 0)
-        pthread_detach(t);
-
-    logmsg("hook ready");
-}    const char *name = _dyld_get_image_name(i);
-        if (name && strstr(name, "roblox")) {
-            logmsg("image %u: %s", i, name);
-        }
-    }
-
-    install_hooks();
-
     logmsg("state=%p pcall=%p loadbuffer=%p originals=(pcall=%p lb=%p)",
            g_lua_state, g_lua_pcall, g_lua_loadbuffer,
            orig_lua_pcall, orig_lua_loadbuffer);
