@@ -86,9 +86,7 @@ static void logmsg(const char *fmt, ...) {
 static void *find_symbol_in_image(const struct mach_header_64 *hdr,
                                   const char *target) {
     const struct segment_command_64 *linkedit = NULL;
-    const struct segment_command_64 *text = NULL;
     const struct symtab_command *symtab = NULL;
-
     uintptr_t base = (uintptr_t)hdr;
     const uint8_t *p = (const uint8_t *)hdr + sizeof(struct mach_header_64);
 
@@ -98,7 +96,6 @@ static void *find_symbol_in_image(const struct mach_header_64 *hdr,
         case LC_SEGMENT_64: {
             const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
             if (strncmp(seg->segname, "__LINKEDIT", 10) == 0) linkedit = seg;
-            if (strncmp(seg->segname, "__TEXT", 6) == 0) text = seg;
             break;
         }
         case LC_SYMTAB:
@@ -108,23 +105,28 @@ static void *find_symbol_in_image(const struct mach_header_64 *hdr,
         p += lc->cmdsize;
     }
 
-    if (!symtab || !linkedit || !text) return NULL;
+    if (!symtab || !linkedit) return NULL;
 
-    intptr_t slide = _dyld_get_image_vmaddr_slide((uint32_t)((uintptr_t)hdr - (uintptr_t)_dyld_get_image_header(0)));
-    // Use global slide instead of per-image for simplicity
-    slide = _dyld_get_image_vmaddr_slide(0);
+    uintptr_t le_start = base + linkedit->vmaddr;
+    uintptr_t le_size = linkedit->filesize;
 
-    const char *strtab = (const char *)(base + symtab->stroff);
-    const struct nlist_64 *syms = (const struct nlist_64 *)(base + symtab->symoff);
+    if (symtab->stroff >= le_size ||
+        symtab->stroff + symtab->strsize > le_size ||
+        symtab->symoff >= le_size ||
+        symtab->symoff + symtab->nsyms * sizeof(struct nlist_64) > le_size)
+        return NULL;
+
+    const char *strtab = (const char *)(le_start + symtab->stroff);
+    const struct nlist_64 *syms = (const struct nlist_64 *)(le_start + symtab->symoff);
 
     for (uint32_t i = 0; i < symtab->nsyms; i++) {
         if (syms[i].n_un.n_strx == 0) continue;
+        if (syms[i].n_un.n_strx >= symtab->strsize) continue;
         if (syms[i].n_value == 0) continue;
         const char *name = strtab + syms[i].n_un.n_strx;
-        if (strcmp(name, target) == 0) {
-            // n_value is vmaddr; add slide for runtime address
-            return (void *)(base + syms[i].n_value - (uintptr_t)hdr + (uintptr_t)hdr);
-        }
+        if (name[0] == '_') name++;
+        if (strcmp(name, target) == 0)
+            return (void *)(base + syms[i].n_value);
     }
     return NULL;
 }
@@ -357,12 +359,30 @@ static void *server_thread(void *arg) {
 // ---------------------------------------------------------------------------
 __attribute__((constructor))
 static void on_load(void) {
-    logmsg("libRbxHook loaded (pid=%d) on arm64", getpid());
+    logmsg("libRbxHook loaded (pid=%d)", getpid());
 
-    // Enumerate images once for visibility
     uint32_t count = _dyld_image_count();
     for (uint32_t i = 0; i < count; i++) {
         const char *name = _dyld_get_image_name(i);
+        if (!name) continue;
+        char namebuf[512];
+        strncpy(namebuf, name, sizeof namebuf - 1);
+        namebuf[sizeof namebuf - 1] = 0;
+        if (strstr(namebuf, "roblox"))
+            logmsg("image %u: %s", i, namebuf);
+    }
+
+    install_hooks();
+
+    logmsg("state=%p pcall=%p loadbuffer=%p",
+           g_lua_state, g_lua_pcall, g_lua_loadbuffer);
+
+    pthread_t t;
+    if (pthread_create(&t, NULL, server_thread, NULL) == 0)
+        pthread_detach(t);
+
+    logmsg("hook ready");
+}    const char *name = _dyld_get_image_name(i);
         if (name && strstr(name, "roblox")) {
             logmsg("image %u: %s", i, name);
         }
