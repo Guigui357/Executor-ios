@@ -33,7 +33,7 @@
 #define LUA_TSTRING  4
 #define LUA_TTABLE   5
 
-typedef void *(*lua_loadbuffer_t)(void *L, const char *buf, size_t sz, const char *name);
+typedef int (*lua_loadbuffer_t)(void *L, const char *buf, size_t sz, const char *name);
 typedef int   (*lua_pcall_t)(void *L, int nargs, int nresults, int errfunc);
 typedef int   (*lua_gettop_t)(void *L);
 typedef void  (*lua_settop_t)(void *L, int idx);
