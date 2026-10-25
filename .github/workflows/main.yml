@@ -27,18 +27,18 @@ jobs:
           git log -1 --oneline
           ls -la
 
-      - name: Build Dobby (iOS arm64 static, Makefile generator)
+      - name: Build Dobby (iOS arm64 static, macOS runner)
         run: |
           cd dobby-src
           mkdir -p build-ios-arm64 && cd build-ios-arm64
           cmake .. \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_SYSTEM_PROCESSOR=arm64 \
-            -DCMAKE_OSX_SYSROOT=$IOS_SDK \
+            -DCMAKE_OSX_SYSROOT=iphoneos \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
-            -DCMAKE_C_COMPILER=$IOS_TOOLCHAIN/arm64-apple-darwin11-clang \
-            -DCMAKE_CXX_COMPILER=$IOS_TOOLCHAIN/arm64-apple-darwin11-clang++ \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++ \
             -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_SHARED_LIBS=OFF \
             -DDynamicBinaryInstrument=ON \
