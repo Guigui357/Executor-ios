@@ -70,14 +70,7 @@ static void logmsg(const char *fmt, ...) {
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
 
-    fprintf(stderr, "[RbxHook] %s\n", buf);
-    fflush(stderr);
-
-    if (!g_log) g_log = fopen("/tmp/rbxhook.log", "a");
-    if (g_log) {
-        fprintf(g_log, "[RbxHook] %s\n", buf);
-        fflush(g_log);
-    }
+    NSLog(@"[RbxHook] %s", buf);
 }
 
 // ---------------------------------------------------------------------------
