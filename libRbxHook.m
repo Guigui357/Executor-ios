@@ -1,12 +1,9 @@
-// libRbxHook.c — Roblox Luau hook for iOS (arm64, non-jailbroken, Dobby)
+// libRbxHook.c — dlsym + heap-scan, no executable-memory patches.
 // Build:
 //   xcrun -sdk iphoneos clang -arch arm64 -dynamiclib \
 //       -o libRbxHook.dylib libRbxHook.c \
-//       -framework Foundation -framework UIKit \
-//       -fobjc-arc -mios-version-min=15.0 \
-//       -I Dobby/include -L Dobby -lDobby
-//
-// Sign with your enterprise cert, inject via NexStore, run.
+//       -framework Foundation -framework UIKit -mios-version-min=15.0 \
+//       -fobjc-arc
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -18,252 +15,169 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <mach/mach.h>
-#include <mach-o/dyld.h>
-#include <mach-o/loader.h>
-#include <mach-o/nlist.h>
-#include <mach-o/fat.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <mach/mach.h>
+#include <mach-o/dyld.h>
 
 #include <Foundation/Foundation.h>
-#include <UIKit/UIKit.h>
 
-// Dobby — inline hook
-#include "dobby.h"
-
-// ---------------------------------------------------------------------------
-// Config
-// ---------------------------------------------------------------------------
 #define HOOK_PORT      47823
 #define MAX_PAYLOAD    (1 << 20)
-#define MAX_LOG        4096
+#define MAX_CANDIDATES 512
 
-// ---------------------------------------------------------------------------
-// Globals
-// ---------------------------------------------------------------------------
-static int  g_srv        = -1;
-static char g_script_buf[MAX_PAYLOAD + 1];
-static char g_log_buf[MAX_LOG];
+// Lua / Luau types (Luau order differs slightly; these are stable):
+#define LUA_TNIL     0
+#define LUA_TBOOLEAN 1
+#define LUA_TNUMBER  3
+#define LUA_TSTRING  4
+#define LUA_TTABLE   5
 
-static void *g_lua_state      = NULL;
-static void *g_lua_pcall      = NULL;
-static void *g_lua_loadbuffer = NULL;
+typedef void *(*lua_loadbuffer_t)(void *L, const char *buf, size_t sz, const char *name);
+typedef int   (*lua_pcall_t)(void *L, int nargs, int nresults, int errfunc);
+typedef int   (*lua_gettop_t)(void *L);
+typedef void  (*lua_settop_t)(void *L, int idx);
+typedef int   (*lua_type_t)(void *L, int idx);
+typedef int   (*lua_getglobal_t)(void *L, const char *name);
 
-static FILE *g_log = NULL;
+static lua_loadbuffer_t p_loadbuffer;
+static lua_pcall_t      p_pcall;
+static lua_gettop_t     p_gettop;
+static lua_settop_t     p_settop;
+static lua_type_t       p_type;
+static lua_getglobal_t  p_getglobal;
 
-// Original function pointers filled by Dobby
-typedef int (*lua_pcall_t)(void *L, int nargs, int nresults, int errfunc);
-typedef int (*lua_loadbuffer_t)(void *L, const char *buf, size_t sz, const char *name);
+static void *g_L = NULL;
+static int   g_srv = -1;
+static char  g_script[MAX_PAYLOAD + 1];
 
-static lua_pcall_t      orig_lua_pcall      = NULL;
-static lua_loadbuffer_t orig_lua_loadbuffer = NULL;
-
-// ---------------------------------------------------------------------------
-// Logging
-// ---------------------------------------------------------------------------
 static void logmsg(const char *fmt, ...) {
-    va_list ap;
-    char buf[1024];
-
-    va_start(ap, fmt);
-    vsnprintf(buf, sizeof buf, fmt, ap);
-    va_end(ap);
-
-    NSLog(@"[RbxHook] %s", buf);
+    va_list ap; char b[1024];
+    va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
+    NSLog(@"[RbxHook] %s", b);
 }
 
-// ---------------------------------------------------------------------------
-// Symbol lookup via dyld image iteration (works on stripped binaries)
-// ---------------------------------------------------------------------------
-static void *find_symbol_in_image(const struct mach_header_64 *hdr,
-                                  const char *target) {
-    const struct segment_command_64 *linkedit = NULL;
-    const struct symtab_command *symtab = NULL;
-    uintptr_t base = (uintptr_t)hdr;
-    const uint8_t *p = (const uint8_t *)hdr + sizeof(struct mach_header_64);
+static int resolve_symbols(void) {
+    p_loadbuffer = (lua_loadbuffer_t)dlsym(RTLD_DEFAULT, "luaL_loadbuffer");
+    p_pcall      = (lua_pcall_t)     dlsym(RTLD_DEFAULT, "lua_pcall");
+    p_gettop     = (lua_gettop_t)    dlsym(RTLD_DEFAULT, "lua_gettop");
+    p_settop     = (lua_settop_t)    dlsym(RTLD_DEFAULT, "lua_settop");
+    p_type       = (lua_type_t)      dlsym(RTLD_DEFAULT, "lua_type");
+    p_getglobal  = (lua_getglobal_t) dlsym(RTLD_DEFAULT, "lua_getglobal");
 
-    for (uint32_t i = 0; i < hdr->ncmds; i++) {
-        const struct load_command *lc = (const struct load_command *)p;
-        switch (lc->cmd) {
-        case LC_SEGMENT_64: {
-            const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
-            if (strncmp(seg->segname, "__LINKEDIT", 10) == 0) linkedit = seg;
-            break;
-        }
-        case LC_SYMTAB:
-            symtab = (const struct symtab_command *)lc;
-            break;
-        }
-        p += lc->cmdsize;
-    }
+    logmsg("sym: lb=%p pc=%p gt=%p st=%p ty=%p gg=%p",
+           p_loadbuffer, p_pcall, p_gettop, p_settop, p_type, p_getglobal);
 
-    if (!symtab || !linkedit) return NULL;
-
-    uintptr_t le_start = base + linkedit->vmaddr;
-    uintptr_t le_size = linkedit->filesize;
-
-    if (symtab->stroff >= le_size ||
-        symtab->stroff + symtab->strsize > le_size ||
-        symtab->symoff >= le_size ||
-        symtab->symoff + symtab->nsyms * sizeof(struct nlist_64) > le_size)
-        return NULL;
-
-    const char *strtab = (const char *)(le_start + symtab->stroff);
-    const struct nlist_64 *syms = (const struct nlist_64 *)(le_start + symtab->symoff);
-
-    for (uint32_t i = 0; i < symtab->nsyms; i++) {
-        if (syms[i].n_un.n_strx == 0) continue;
-        if (syms[i].n_un.n_strx >= symtab->strsize) continue;
-        if (syms[i].n_value == 0) continue;
-        const char *name = strtab + syms[i].n_un.n_strx;
-        if (name[0] == '_') name++;
-        if (strcmp(name, target) == 0)
-            return (void *)(base + syms[i].n_value);
-    }
-    return NULL;
+    return (p_loadbuffer && p_pcall && p_gettop && p_settop && p_type && p_getglobal);
 }
 
-static void *find_any_symbol(const char *name) {
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const struct mach_header_64 *hdr = (const struct mach_header_64 *)_dyld_get_image_header(i);
-        if (!hdr || hdr->magic != MH_MAGIC_64) continue;
-        void *found = find_symbol_in_image(hdr, name);
-        if (found) {
-            logmsg("symbol %s @ %p (image %u)", name, found, i);
-            return found;
-        }
-    }
-    return NULL;
+// --- Heap walk: collect plausible lua_State pointers -------------------------
+//
+// Luau lua_State layout (simplified, 8.x):
+//   offset 0:  uint8_t tt           (tag byte; Luau uses 6 for THREAD-ish)
+//   offset 1:  uint8_t marked
+//   offset 4:  uint8_t status
+//   offset 8:  global_State *l_G   (pointer into another heap region)
+//   offset 24: StkId base          (pointer into the thread's stack)
+//   offset 32: StkId top
+// We do NOT assume exact offsets — we validate by calling lua_gettop().
+//
+// Strategy: scan all rw- regions for 8-byte values that point into a
+// different rw- region (candidate l_G), then test the *container* address
+// as a lua_State by calling lua_gettop().
+//
+// Better strategy: an actual lua_State is the first word of a thread block,
+// and Roblox's main state is *persistent* — created once at boot, never freed.
+// We can't tell which is main, but we can try candidates in order until one
+// has a `game` global of type table.
+
+static int is_readable_addr(vm_address_t a) {
+    vm_size_t sz = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t obj = MACH_PORT_NULL;
+    kern_return_t kr = vm_region_64(mach_task_self(), &a, &sz,
+                                    VM_REGION_BASIC_INFO_64,
+                                    (vm_region_info_t)&info, &cnt, &obj);
+    if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+    return kr == KERN_SUCCESS;
 }
 
-// ---------------------------------------------------------------------------
-// Prologue scan for lua_pcall / luaL_loadbuffer in __TEXT of every image
-// ---------------------------------------------------------------------------
-static void *scan_text_for_sig(const uint8_t *sig, size_t sig_len,
-                               const char **out_image) {
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const struct mach_header_64 *hdr = (const struct mach_header_64 *)_dyld_get_image_header(i);
-        if (!hdr || hdr->magic != MH_MAGIC_64) continue;
-        const uint8_t *p = (const uint8_t *)hdr + sizeof(struct mach_header_64);
-        for (uint32_t j = 0; j < hdr->ncmds; j++) {
-            const struct load_command *lc = (const struct load_command *)p;
-            if (lc->cmd == LC_SEGMENT_64) {
-                const struct segment_command_64 *seg = (const struct segment_command_64 *)lc;
-                if (strncmp(seg->segname, "__TEXT", 6) == 0) {
-                    const uint8_t *text = (const uint8_t *)hdr + seg->vmaddr;
-                    const uint8_t *text_end = text + seg->filesize;
-                    for (const uint8_t *q = text; q + sig_len < text_end; q++) {
-                        if (((uintptr_t)q & 3) != 0) continue;
-                        if (memcmp(q, sig, sig_len) == 0) {
-                            if (out_image) *out_image = _dyld_get_image_name(i);
-                            return (void *)q;
-                        }
-                    }
+static int validate_L(void *L) {
+    if (!L) return 0;
+    if (!is_readable_addr((vm_address_t)L)) return 0;
+
+    int top;
+    // Guard against segfault on bogus candidate — assume readable,
+    // but check the top value looks sane before diving in.
+    // (Roblox's lua_gettop reads L->top - L->base; if the struct is garbage,
+    //  this can crash. We accept that risk; the scan is best-effort.)
+    top = p_gettop(L);
+    if (top < 0 || top > 100000) return 0;
+
+    // Leave a TValue on the stack, then pop it.
+    p_getglobal(L, "game");
+    int t = p_type(L, -1);
+    p_settop(L, top);           // restore exact pre-call stack depth
+    return t == LUA_TTABLE ? 1 : 0;
+}
+
+static void scan_for_L(void) {
+    if (g_L && validate_L(g_L)) return;
+
+    vm_address_t addr = 0;
+    vm_size_t size = 0;
+    int tested = 0, found = 0;
+
+    while (tested < MAX_CANDIDATES) {
+        vm_region_basic_info_data_64_t info;
+        mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t obj = MACH_PORT_NULL;
+
+        kern_return_t kr = vm_region_64(mach_task_self(), &addr, &size,
+                                        VM_REGION_BASIC_INFO_64,
+                                        (vm_region_info_t)&info, &cnt, &obj);
+        if (obj != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), obj);
+        if (kr != KERN_SUCCESS) break;
+
+        // Only consider writable, non-executable pages.
+        int writable = (info.protection & VM_PROT_WRITE);
+        int exec     = (info.protection & VM_PROT_EXECUTE);
+        if (writable && !exec) {
+            uint8_t *p = (uint8_t *)addr;
+            for (vm_size_t off = 0; off + 64 < size; off += 8) {
+                // The lua_State is 8-aligned. Candidate header at p+off.
+                // Cheap pre-check: read the l_G pointer at +8, confirm it's
+                // in the same heap class (readable, writable, non-exec).
+                uintptr_t cand = (uintptr_t)(p + off);
+                uintptr_t g_ptr = *(uintptr_t *)(cand + 8);
+
+                if (!is_readable_addr(g_ptr)) continue;
+                if (g_ptr < 0x1000) continue;
+
+                tested++;
+                if (validate_L((void *)cand)) {
+                    g_L = (void *)cand;
+                    logmsg("L found @ %p after %d candidates", g_L, tested);
+                    found = 1;
+                    break;
                 }
+                if (tested >= MAX_CANDIDATES) break;
             }
-            p += lc->cmdsize;
         }
+        addr += size;
+        if (found) break;
     }
-    return NULL;
+
+    if (!g_L) logmsg("L not found after %d candidates", tested);
 }
 
-// luaL_loadbuffer prologue: stp x29,x30,[sp,#-0x30]!; str x21,[sp,#0x10]; stp x20,x19,[sp,#0x20]; mov x29,sp
-static const uint8_t SIG_LOADBUF[] = {
-    0xFD,0x7B,0xBD,0xA9, 0xF5,0x0B,0x00,0xF9,
-    0xF4,0x4F,0x02,0xA9, 0xFD,0x03,0x00,0x91,
-};
+// --- Server -----------------------------------------------------------------
 
-// lua_pcall prologue: stp x29,x30,[sp,#-0x20]!; stp x20,x19,[sp,#0x10]; mov x29,sp; mov x19,x0
-static const uint8_t SIG_PCALL[] = {
-    0xFD,0x7B,0xBE,0xA9, 0xF4,0x4F,0x01,0xA9,
-    0xFD,0x03,0x00,0x91, 0xF3,0x03,0x00,0xAA,
-};
-
-// ---------------------------------------------------------------------------
-// Hook implementations
-// ---------------------------------------------------------------------------
-static int my_lua_pcall(void *L, int nargs, int nresults, int errfunc) {
-    if (!g_lua_state && L) {
-        g_lua_state = L;
-        logmsg("captured lua_State @ %p (from pcall)", L);
-    }
-    return orig_lua_pcall ? orig_lua_pcall(L, nargs, nresults, errfunc) : -1;
-}
-
-static int my_luaL_loadbuffer(void *L, const char *buf, size_t sz, const char *name) {
-    if (!g_lua_state && L) {
-        g_lua_state = L;
-        logmsg("captured lua_State @ %p (from loadbuffer)", L);
-    }
-    return orig_lua_loadbuffer ? orig_lua_loadbuffer(L, buf, sz, name) : -1;
-}
-
-static void install_hooks(void) {
-    // Try symbols first (rare for Roblox but cheap to check)
-    if (!g_lua_pcall) {
-        g_lua_pcall = find_any_symbol("lua_pcall");
-    }
-    if (!g_lua_loadbuffer) {
-        g_lua_loadbuffer = find_any_symbol("luaL_loadbuffer");
-    }
-
-    // Prologue scan if symbols missing
-    if (!g_lua_pcall) {
-        const char *img = NULL;
-        g_lua_pcall = scan_text_for_sig(SIG_PCALL, sizeof SIG_PCALL, &img);
-        if (g_lua_pcall) logmsg("lua_pcall prologue match @ %p in %s", g_lua_pcall, img ? img : "?");
-    }
-    if (!g_lua_loadbuffer) {
-        const char *img = NULL;
-        g_lua_loadbuffer = scan_text_for_sig(SIG_LOADBUF, sizeof SIG_LOADBUF, &img);
-        if (g_lua_loadbuffer) logmsg("luaL_loadbuffer prologue match @ %p in %s", g_lua_loadbuffer, img ? img : "?");
-    }
-
-    // Hook luaL_loadbuffer with Dobby
-    if (g_lua_loadbuffer) {
-        int r = DobbyHook((void *)g_lua_loadbuffer,
-                          (void *)my_luaL_loadbuffer,
-                          (void **)&orig_lua_loadbuffer);
-        logmsg("DobbyHook loadbuffer @ %p => %d", g_lua_loadbuffer, r);
-    }
-
-    // Hook lua_pcall with Dobby
-    if (g_lua_pcall) {
-        int r = DobbyHook((void *)g_lua_pcall,
-                          (void *)my_lua_pcall,
-                          (void **)&orig_lua_pcall);
-        logmsg("DobbyHook lua_pcall @ %p => %d", g_lua_pcall, r);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Execute a script through the discovered state
-// ---------------------------------------------------------------------------
-static int run_script(void *L, const char *src, size_t len, const char *name) {
-    if (!L) { logmsg("run_script: no L"); return -1; }
-    if (!orig_lua_loadbuffer || !orig_lua_pcall) {
-        logmsg("run_script: no funcs (lb=%p pc=%p)", orig_lua_loadbuffer, orig_lua_pcall);
-        return -1;
-    }
-    int r1 = orig_lua_loadbuffer(L, src, len, name ? name : "=rbxexec");
-    logmsg("loadbuffer(L=%p) = %d", L, r1);
-    if (r1 != 0) return -1;
-    int r2 = orig_lua_pcall(L, 0, 0, 0);
-    logmsg("pcall(L=%p) = %d", L, r2);
-    return r2;
-}
-
-// ---------------------------------------------------------------------------
-// TCP server
-// ---------------------------------------------------------------------------
 static int read_line(int fd, char *out, size_t cap) {
     size_t i = 0;
     while (i + 1 < cap) {
-        char c;
-        ssize_t r = read(fd, &c, 1);
+        char c; ssize_t r = read(fd, &c, 1);
         if (r <= 0) return -1;
         if (c == '\n') { out[i] = 0; return (int)i; }
         out[i++] = c;
@@ -272,26 +186,44 @@ static int read_line(int fd, char *out, size_t cap) {
     return -1;
 }
 
+static int exec_script(const char *src, size_t len, const char *name) {
+    if (!g_L) scan_for_L();
+    if (!g_L) return -1;
+
+    int base = p_gettop(g_L);
+    int rc = p_loadbuffer(g_L, src, len, name ? name : "=rbxexec");
+    logmsg("loadbuffer -> %d", rc);
+    if (rc != 0) {
+        // error string on top, leave it for caller? just restore depth.
+        p_settop(g_L, base);
+        return -2;
+    }
+    rc = p_pcall(g_L, 0, 0, 0);
+    logmsg("pcall -> %d", rc);
+    p_settop(g_L, base);
+    return rc;
+}
+
 static void *server_thread(void *arg) {
     (void)arg;
     signal(SIGPIPE, SIG_IGN);
 
     g_srv = socket(AF_INET, SOCK_STREAM, 0);
-    if (g_srv < 0) { logmsg("socket failed: %d", errno); return NULL; }
+    if (g_srv < 0) { logmsg("socket %d", errno); return NULL; }
 
     int opt = 1;
     setsockopt(g_srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof opt);
 
-    struct sockaddr_in addr = {0};
-    addr.sin_family      = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port        = htons(HOOK_PORT);
+    struct sockaddr_in a = {0};
+    a.sin_family = AF_INET;
+    a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    a.sin_port = htons(HOOK_PORT);
 
-    if (bind(g_srv, (struct sockaddr *)&addr, sizeof addr) != 0) {
-        logmsg("bind failed: %d", errno); close(g_srv); return NULL;
+    if (bind(g_srv, (struct sockaddr *)&a, sizeof a) != 0) {
+        logmsg("bind %d", errno); close(g_srv); return NULL;
     }
     if (listen(g_srv, 4) != 0) {
-        logmsg("listen failed: %d", errno); close(g_srv); return NULL;
+        logmsg("listen %d", errno); close(g_srv); return NULL;
     }
     logmsg("listening on 127.0.0.1:%d", HOOK_PORT);
 
@@ -308,7 +240,6 @@ static void *server_thread(void *arg) {
         if (sscanf(hdr, "SIZE %ld", &n) != 1 || n < 0 || n > MAX_PAYLOAD) {
             write(cli, "E size\n", 7); close(cli); continue;
         }
-
         char nhdr[128];
         if (read_line(cli, nhdr, sizeof nhdr) < 0) { close(cli); continue; }
         char name[128] = "=rbxexec";
@@ -322,24 +253,15 @@ static void *server_thread(void *arg) {
 
         size_t got = 0;
         while (got < (size_t)n) {
-            ssize_t r = read(cli, g_script_buf + got, n - got);
+            ssize_t r = read(cli, g_script + got, n - got);
             if (r <= 0) break;
             got += r;
         }
-        g_script_buf[got] = 0;
+        g_script[got] = 0;
 
         if (got != (size_t)n) { write(cli, "E short\n", 8); close(cli); continue; }
 
-        logmsg("received %zu bytes name=%s", got, name);
-
-        if (!g_lua_state) {
-            logmsg("no lua_State captured yet — waiting for Roblox to call loadbuffer/pcall");
-            write(cli, "E nolua\n", 7);
-            close(cli);
-            continue;
-        }
-
-        int rc = run_script(g_lua_state, g_script_buf, got, name);
+        int rc = exec_script(g_script, got, name);
         const char *reply = (rc == 0) ? "0 OK\n" : "1 ERR\n";
         write(cli, reply, strlen(reply));
         close(cli);
@@ -347,36 +269,15 @@ static void *server_thread(void *arg) {
     return NULL;
 }
 
-// ---------------------------------------------------------------------------
-// Constructor
-// ---------------------------------------------------------------------------
 __attribute__((constructor))
 static void on_load(void) {
     logmsg("libRbxHook loaded (pid=%d)", getpid());
 
-    uint32_t count = _dyld_image_count();
-    for (uint32_t i = 0; i < count; i++) {
-        const char *name = _dyld_get_image_name(i);
-        if (!name) continue;
-        char namebuf[512];
-        strncpy(namebuf, name, sizeof namebuf - 1);
-        namebuf[sizeof namebuf - 1] = 0;
-        if (strstr(namebuf, "roblox"))
-            logmsg("image %u: %s", i, namebuf);
+    if (!resolve_symbols()) {
+        logmsg("FATAL: Roblox does not export lua_* symbols. dlsym path dead. Jailbreak required.");
+        return;
     }
-
-    install_hooks();
-
-    logmsg("state=%p pcall=%p loadbuffer=%p originals=(pcall=%p lb=%p)",
-           g_lua_state, g_lua_pcall, g_lua_loadbuffer,
-           orig_lua_pcall, orig_lua_loadbuffer);
 
     pthread_t t;
-    if (pthread_create(&t, NULL, server_thread, NULL) == 0) {
-        pthread_detach(t);
-    } else {
-        logmsg("pthread_create failed");
-    }
-
-    logmsg("hook ready");
+    if (pthread_create(&t, NULL, server_thread, NULL) == 0) pthread_detach(t);
 }
