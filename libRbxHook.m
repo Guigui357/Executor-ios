@@ -55,17 +55,8 @@ static void logmsg(const char *fmt, ...) {
     va_list ap; char b[1024];
     va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
 
-    // 1. stderr — bypasses os_log privacy entirely. This is the one that shows in idevicesyslog.
     fprintf(stderr, "[RbxHook] %s\n", b);
     fflush(stderr);
-
-    // 2. os_log with explicit public marker — survives Apple's privacy redaction.
-    NSLog(@"[RbxHook] %{public}s", b);
-
-    // 3. file fallback — survives everything, including stderr being swallowed.
-    static FILE *f = NULL;
-    if (!f) f = fopen("/tmp/rbxhook.log", "a");
-    if (f) { fprintf(f, "%s\n", b); fflush(f); }
 }
 
 static int resolve_symbols(void) {
