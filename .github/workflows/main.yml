@@ -139,7 +139,7 @@ jobs:
           SDK=$(xcrun --sdk iphoneos --show-sdk-path)
           echo "SDK: $SDK"
           xcrun -sdk iphoneos clang++ -arch arm64 -dynamiclib \
-            -o libRbxHook.dylib libRbxHook.c \
+            -o libRbxHook.dylib libRbxHook.m \
             -framework Foundation -framework UIKit \
             -fobjc-arc -mios-version-min=15.0 \
             -I dobby-out/include \
