@@ -26,6 +26,7 @@
 #include <mach-o/dyld.h>
 #include <malloc/malloc.h>
 #include <dispatch/dispatch.h>
+#include <os/log.h>
 
 #include <Foundation/Foundation.h>
 
@@ -62,15 +63,25 @@ static int   g_srv     = -1;
 static char  g_script[MAX_PAYLOAD + 1];
 
 // --- Logging ----------------------------------------------------------------
+static os_log_t g_log_handle = NULL;
+
 static void logmsg(const char *fmt, ...) {
     va_list ap; char b[1024];
     va_start(ap, fmt); vsnprintf(b, sizeof b, fmt, ap); va_end(ap);
 
-    fprintf(stderr, "[RbxHook] %s\n", b);
-    fflush(stderr);
+    // 1. os_log — the only channel that survives sandbox + Roblox stderr redirection.
+    if (!g_log_handle) {
+        g_log_handle = os_log_create("com.you.rbxhook", "hook");
+    }
+    os_log_with_type(g_log_handle, OS_LOG_TYPE_DEFAULT, "[RbxHook] %{public}s", b);
 
+    // 2. File — inside app sandbox, not /tmp.
     static FILE *f = NULL;
-    if (!f) f = fopen("/tmp/rbxhook.log", "a");
+    if (!f) {
+        NSString *tmp = NSTemporaryDirectory();
+        NSString *path = [tmp stringByAppendingPathComponent:@"rbxhook.log"];
+        f = fopen([path UTF8String], "a");
+    }
     if (f) { fprintf(f, "%s\n", b); fflush(f); }
 }
 
