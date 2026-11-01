@@ -44,5 +44,4 @@ jobs:
       uses: actions/upload-artifact@v4
       with:
         name: libRbxHook-dylib
-        with:
-          path: libRbxHook.dylib
+        path: libRbxHook.dylib
